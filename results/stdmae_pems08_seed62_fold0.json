@@ -1,0 +1,38 @@
+{
+  "model": "STD-MAE",
+  "dataset": "PEMS08",
+  "config": {
+    "d_model": 64,
+    "num_layers": 3,
+    "nhead": 4,
+    "spatial_mask_ratio": 0.25,
+    "temporal_mask_ratio": 0.25,
+    "epochs_pretrain": 50,
+    "epochs_finetune": 50,
+    "lr_pretrain": 0.001,
+    "lr_finetune": 0.0001,
+    "batch_size": 32,
+    "seed": 62,
+    "fold": "0"
+  },
+  "results": {
+    "15": {
+      "mae": 16.29273796081543,
+      "rmse": 25.651874542236328,
+      "mape": 10.343483924865723,
+      "wmape": 6.950020790100098
+    },
+    "30": {
+      "mae": 16.66107177734375,
+      "rmse": 26.283803939819336,
+      "mape": 10.420106887817383,
+      "wmape": 7.096031188964844
+    },
+    "60": {
+      "mae": 17.76382827758789,
+      "rmse": 27.8712100982666,
+      "mape": 11.310081481933594,
+      "wmape": 7.54177188873291
+    }
+  }
+}

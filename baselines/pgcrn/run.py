@@ -1,0 +1,324 @@
+# -*- coding: utf-8 -*-
+"""
+Entry point cho PGCRN (Patch-based GCRN) baseline.
+Paper: Rao et al., GeoInformatica 2025.
+
+Usage:
+  python -m baselines.pgcrn.run --dataset PEMS04 --epochs 50
+  python -m baselines.pgcrn.run --dataset PEMS08 --epochs 50
+  python -m baselines.pgcrn.run --dataset PEMS04 --smoke-test
+  python -m baselines.pgcrn.run --dataset PEMS08 --seed 42 --fold 0
+"""
+
+import argparse
+import sys
+import os
+import random
+import json
+import time
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+
+# Seed sẽ được set SAU khi parse args (hỗ trợ --seed linh hoạt)
+
+ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", ".."))
+sys.path.insert(0, ROOT)
+
+from baselines.common.dataloader import load_dataset
+from baselines.common.metrics import masked_mae
+from baselines.common.trainer import EarlyStopping, test_model, _get_scaler_params, get_teacher_forcing_ratio
+from baselines.pgcrn.model import PGCRN
+
+
+def set_seed(seed):
+    """Cố định seed cho reproducibility — gọi SAU parse_args."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def get_args():
+    parser = argparse.ArgumentParser(description="PGCRN Baseline (2025)")
+    parser.add_argument("--dataset", type=str, default="PEMS04", choices=["PEMS04", "PEMS08"])
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--hidden-dim", type=int, default=64)
+    parser.add_argument("--num-layers", type=int, default=2)
+    parser.add_argument("--patch-len", type=int, default=3)
+    parser.add_argument("--tf-start", type=float, default=0.8, help="Scheduled sampling TF start ratio")
+    parser.add_argument("--tf-end", type=float, default=0.0, help="Scheduled sampling TF end ratio")
+    parser.add_argument("--patience", type=int, default=20)
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--fold", type=str, default="default",
+                        help="Fold index (0,1,2,3) hoặc 'default' cho split chuẩn 60/20/20")
+    parser.add_argument("--smoke-test", action="store_true", help="Chạy nhanh 2-3 epoch kiểm tra pipeline")
+    return parser.parse_args()
+
+
+def train_epoch_pgcrn(
+    model: nn.Module,
+    loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    scaler,
+    teacher_forcing_ratio: float = 0.5,
+    max_batches: int = None,
+) -> float:
+    """1 epoch training cho PGCRN có Teacher Forcing."""
+    model.train()
+    total_loss = 0.0
+    total_samples = 0
+
+    mean, std = _get_scaler_params(scaler)
+    mean_t = torch.tensor(mean, dtype=torch.float32, device=device)
+    std_t = torch.tensor(std, dtype=torch.float32, device=device)
+
+    for batch_idx, (X, y) in enumerate(loader):
+        if max_batches is not None and batch_idx >= max_batches:
+            break
+        X = X.to(device)
+        y = y.to(device)
+
+        # Normalize target y_norm cho teacher forcing và loss
+        y_norm = (y - mean_t) / std_t
+
+        optimizer.zero_grad()
+        # Huấn luyện với Teacher Forcing
+        pred = model(X, y=y_norm, teacher_forcing_ratio=teacher_forcing_ratio)
+
+        loss = masked_mae(pred, y_norm)
+        loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+        optimizer.step()
+
+        total_loss += loss.item() * X.size(0)
+        total_samples += X.size(0)
+
+    return total_loss / max(total_samples, 1)
+
+
+@torch.no_grad()
+def eval_epoch_pgcrn(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    scaler,
+    max_batches: int = None,
+) -> float:
+    """1 epoch validation cho PGCRN (không dùng teacher forcing)."""
+    model.eval()
+    total_loss = 0.0
+    total_samples = 0
+
+    mean, std = _get_scaler_params(scaler)
+    mean_t = torch.tensor(mean, dtype=torch.float32, device=device)
+    std_t = torch.tensor(std, dtype=torch.float32, device=device)
+
+    for batch_idx, (X, y) in enumerate(loader):
+        if max_batches is not None and batch_idx >= max_batches:
+            break
+        X = X.to(device)
+        y = y.to(device)
+
+        y_norm = (y - mean_t) / std_t
+        pred = model(X)  # Tự hồi quy (Inference mode)
+
+        loss = masked_mae(pred, y_norm)
+        total_loss += loss.item() * X.size(0)
+        total_samples += X.size(0)
+
+    return total_loss / max(total_samples, 1)
+
+
+def train_pgcrn(
+    model: nn.Module,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    test_loader: DataLoader,
+    scaler,
+    *,
+    epochs: int = 50,
+    lr: float = 1e-3,
+    tf_start: float = 0.8,
+    tf_end: float = 0.0,
+    teacher_forcing_ratio: float = None,
+    patience: int = 10,
+    device: torch.device = torch.device("cpu"),
+    model_name: str = "PGCRN",
+    save_dir: str = "checkpoints",
+    max_batches_per_epoch: int = None,
+) -> dict:
+    """Vòng lặp huấn luyện đầy đủ cho PGCRN với Scheduled Sampling."""
+    os.makedirs(save_dir, exist_ok=True)
+    model = model.to(device)
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=0.5, patience=5, min_lr=1e-5
+    )
+    early_stop = EarlyStopping(patience=patience)
+
+    total_batches = len(train_loader)
+    effective_batches = min(max_batches_per_epoch, total_batches) if max_batches_per_epoch else total_batches
+
+    start_ratio = teacher_forcing_ratio if teacher_forcing_ratio is not None else tf_start
+
+    print(f"\n{'='*60}")
+    print(f"Training: {model_name} | Epochs: {epochs} | LR: {lr} | Device: {device}")
+    print(f"Scheduled Sampling: TF_start={start_ratio:.2f} -> TF_end={tf_end:.2f}")
+    print(f"Params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+    if max_batches_per_epoch:
+        print(f"[SMOKE] Max {effective_batches}/{total_batches} batches/epoch")
+    print(f"{'='*60}")
+
+    t0 = time.time()
+
+    for epoch in range(1, epochs + 1):
+        t_ep = time.time()
+        tf_ratio = get_teacher_forcing_ratio(epoch, epochs, start=start_ratio, end=tf_end)
+        train_loss = train_epoch_pgcrn(
+            model, train_loader, optimizer, device, scaler,
+            teacher_forcing_ratio=tf_ratio,
+            max_batches=max_batches_per_epoch
+        )
+        val_loss = eval_epoch_pgcrn(
+            model, val_loader, device, scaler,
+            max_batches=max_batches_per_epoch
+        )
+        scheduler.step(val_loss)
+
+        elapsed = time.time() - t_ep
+        if epoch % 5 == 0 or epoch == 1:
+            print(f"Epoch {epoch:3d}/{epochs} | TF_ratio: {tf_ratio:.2f} | Train MAE: {train_loss:.4f} | Val MAE: {val_loss:.4f} | {elapsed:.1f}s")
+
+        if early_stop.step(val_loss, model):
+            print(f"[EarlyStopping] Stopped at epoch {epoch} | Best Val MAE: {early_stop.best_loss:.4f}")
+            break
+
+    early_stop.restore_best(model)
+    total_time = time.time() - t0
+    print(f"\nTraining done in {total_time/60:.1f} min. Best Val MAE: {early_stop.best_loss:.4f}")
+
+    # Lưu checkpoint
+    checkpoint_path = os.path.join(save_dir, "best_model.pt")
+    torch.save(model.state_dict(), checkpoint_path)
+
+    # Đánh giá trên tập test (Inference mode)
+    results = test_model(model, test_loader, device, scaler)
+
+    # Lưu train_summary.json với đường dẫn tương đối (Relative Path)
+    rel_save_dir = os.path.relpath(save_dir, ROOT).replace("\\", "/")
+    summary = {
+        "model_name": model_name,
+        "checkpoint_dir": rel_save_dir,
+        "checkpoint_file": f"{rel_save_dir}/best_model.pt",
+        "best_val_mae": float(early_stop.best_loss),
+        "epochs_trained": epoch,
+        "training_time_seconds": round(total_time, 2),
+        "results": results,
+    }
+    summary_path = os.path.join(save_dir, "train_summary.json")
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
+
+    print(f"\n[Test Results — {model_name}]")
+    print(f"{'Horizon':>10} {'MAE':>8} {'RMSE':>8} {'MAPE(%)':>10} {'WMAPE(%)':>10}")
+    print(f"{'-'*52}")
+    for minutes, m in sorted(results.items()):
+        wmape_val = f"{m.get('wmape', 0.0):>10.2f}"
+        print(f"{minutes:>8}min {m['mae']:>8.4f} {m['rmse']:>8.4f} {m['mape']:>10.2f} {wmape_val}")
+
+    return results
+
+
+def main():
+    args = get_args()
+    set_seed(args.seed)
+
+    fold = int(args.fold) if args.fold.isdigit() else None
+
+    smoke_max_batches = None
+    if args.smoke_test:
+        args.epochs = 3
+        args.batch_size = 64
+        smoke_max_batches = 10
+        print("[SMOKE TEST] epochs=3, batch=64, max_batches=10")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device} | Seed: {args.seed} | Fold: {args.fold}")
+
+    # Load dữ liệu và ma trận kề cố định
+    train_loader, val_loader, test_loader, scaler, adj_matrix = load_dataset(
+        args.dataset, batch_size=args.batch_size, fold=fold
+    )
+    num_nodes = adj_matrix.shape[0]
+
+    # Khởi tạo mô hình PGCRN — KHÔNG thay đổi bất kỳ tham số kiến trúc nào
+    model = PGCRN(
+        num_nodes=num_nodes,
+        adj_matrix=adj_matrix,
+        in_dim=3,
+        hidden_dim=args.hidden_dim,
+        out_dim=1,
+        num_layers=args.num_layers,
+        horizon=12,
+        patch_len=args.patch_len,
+    )
+
+    # Checkpoint path: bao gồm seed + fold
+    fold_tag = f"fold{args.fold}" if args.fold != "default" else "default"
+    ckpt_tag = f"pgcrn_{args.dataset.lower()}_seed{args.seed}_{fold_tag}"
+    save_dir = os.path.join(ROOT, "checkpoints", ckpt_tag)
+
+    results = train_pgcrn(
+        model, train_loader, val_loader, test_loader, scaler,
+        epochs=args.epochs,
+        lr=args.lr,
+        tf_start=args.tf_start,
+        tf_end=args.tf_end,
+        patience=args.patience,
+        device=device,
+        model_name=f"PGCRN_{args.dataset}",
+        save_dir=save_dir,
+        max_batches_per_epoch=smoke_max_batches,
+    )
+
+    if args.smoke_test:
+        print("\n[SMOKE TEST] Pipeline check passed.")
+        return results
+
+    # Lưu kết quả — tên file bao gồm seed + fold
+    results_dir = os.path.join(ROOT, "results")
+    os.makedirs(results_dir, exist_ok=True)
+    out_path = os.path.join(results_dir, f"pgcrn_{args.dataset.lower()}_seed{args.seed}_{fold_tag}.json")
+    out_data = {
+        "model": "PGCRN",
+        "dataset": args.dataset,
+        "config": {
+            "hidden_dim": args.hidden_dim,
+            "num_layers": args.num_layers,
+            "patch_len": args.patch_len,
+            "epochs": args.epochs,
+            "lr": args.lr,
+            "batch_size": args.batch_size,
+            "seed": args.seed,
+            "fold": args.fold,
+        },
+        "results": results,
+    }
+    with open(out_path, "w") as f:
+        json.dump(out_data, f, indent=2)
+    print(f"\nResults saved to: {out_path}")
+
+    return results
+
+
+if __name__ == "__main__":
+    main()
