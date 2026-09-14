@@ -185,18 +185,14 @@ class PGCRN(nn.Module):
         B = h[0].shape[0]
         device = h[0].device
 
-        # Patch đầu vào ban đầu cho decoder là zeros
-        dec_input_raw = torch.zeros(B, self.num_nodes, self.patch_len * self.out_dim, device=device)
+        # Patch đầu vào ban đầu cho
+        #  decoder (GO token = zeros)
+        dec_in = torch.zeros(B, self.num_nodes, self.patch_len * self.out_dim, device=device)
         pred_patches = []
 
         for p in range(self.num_patches_out):
-            # Teacher forcing
-            if self.training and y_patches is not None and random.random() < teacher_forcing_ratio:
-                current_input = y_patches[:, p, :, :]
-            else:
-                current_input = dec_input_raw
-
-            x_p = self.dec_patch_proj(current_input)  # (B, N, hidden_dim)
+            # Input dự báo patch p được chiếu từ dec_in (zeros ở p=0, hoặc patch p-1 trước đó)
+            x_p = self.dec_patch_proj(dec_in)  # (B, N, hidden_dim)
 
             h_new = list(h)
             for layer_i, cell in enumerate(self.decoder_cells):
@@ -206,7 +202,13 @@ class PGCRN(nn.Module):
 
             pred_p = self.output_proj(x_p)  # (B, N, patch_len * out_dim)
             pred_patches.append(pred_p.unsqueeze(1))
-            dec_input_raw = pred_p.detach()
+
+            # Scheduled Sampling / Teacher Forcing cho patch TIẾP THEO (p + 1):
+            # Tuyệt đối không rò rỉ target của patch hiện tại vào chính nó!
+            if self.training and y_patches is not None and random.random() < teacher_forcing_ratio:
+                dec_in = y_patches[:, p, :, :]
+            else:
+                dec_in = pred_p.detach()
 
         return torch.cat(pred_patches, dim=1)  # (B, num_patches_out, N, patch_len * out_dim)
 
