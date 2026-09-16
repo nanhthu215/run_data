@@ -50,48 +50,83 @@ ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, ROOT)
 
 # =========================================================================
-# Danh sách 8 cấu hình Ablation Study
+# Danh sách 11 cấu hình Ablation Study theo 4 Trụ Cột Khoa Học
 # =========================================================================
 ABLATION_CONFIGS = {
+    # --- TRỤ CỘT 1: Bản Chất & Hợp Nhất Đồ Thị (Graph Topology) ---
     "physical": {
         "name": "T-GCN-P (Physical only)",
+        "pillar": "Trụ cột 1: Bản chất đồ thị",
         "args": ["--graph-mode", "physical"],
         "out_tag": "physical",
     },
     "adaptive": {
         "name": "T-GCN-A (Adaptive only)",
+        "pillar": "Trụ cột 1: Bản chất đồ thị",
         "args": ["--graph-mode", "adaptive"],
         "out_tag": "adaptive",
     },
     "fused_fixed": {
         "name": "T-GCN-PA (Fixed alpha=0.5)",
+        "pillar": "Trụ cột 1: Bản chất đồ thị",
         "args": ["--graph-mode", "fused", "--fusion-type", "fixed", "--alpha", "0.5"],
         "out_tag": "fused_fixed_a0.5",
     },
     "fused_learnable": {
-        "name": "T-GCN-PA (Learnable alpha)",
+        "name": "T-GCN-PA (Learnable alpha, k=0)",
+        "pillar": "Trụ cột 1: Bản chất đồ thị",
         "args": ["--graph-mode", "fused", "--fusion-type", "learnable"],
         "out_tag": "fused_learnable",
     },
+
+    # --- TRỤ CỘT 2: Độ Thưa Đồ Thị (Top-k Sparsification) ---
     "topk_5": {
-        "name": "T-GCN-PA (Learnable + Top-k=5)",
+        "name": "T-GCN-PA (Top-k=5)",
+        "pillar": "Trụ cột 2: Độ thưa Top-k",
         "args": ["--graph-mode", "fused", "--fusion-type", "learnable", "--top-k", "5"],
         "out_tag": "fused_learnable_k5",
     },
     "topk_10": {
-        "name": "T-GCN-PA (Learnable + Top-k=10)",
+        "name": "T-GCN-PA (Top-k=10)",
+        "pillar": "Trụ cột 2: Độ thưa Top-k",
         "args": ["--graph-mode", "fused", "--fusion-type", "learnable", "--top-k", "10"],
         "out_tag": "fused_learnable_k10",
     },
     "topk_20": {
-        "name": "T-GCN-PA (Learnable + Top-k=20)",
+        "name": "T-GCN-PA (Top-k=20)",
+        "pillar": "Trụ cột 2: Độ thưa Top-k",
         "args": ["--graph-mode", "fused", "--fusion-type", "learnable", "--top-k", "20"],
         "out_tag": "fused_learnable_k20",
     },
     "topk_10_reg": {
         "name": "T-GCN-PA (Top-k=10 + Graph Reg)",
+        "pillar": "Trụ cột 2: Ràng buộc đồ thị",
         "args": ["--graph-mode", "fused", "--fusion-type", "learnable", "--top-k", "10", "--use-graph-reg"],
         "out_tag": "fused_learnable_k10_reg",
+    },
+
+    # --- TRỤ CỘT 3: Không Gian GCN (1-Hop vs Multi-Support Directed Diffusion) ---
+    "gcn_hop1": {
+        "name": "T-GCN-PA (1-Hop GCN [X, AX])",
+        "pillar": "Trụ cột 3: Động học không gian GCN",
+        "args": ["--graph-mode", "fused", "--fusion-type", "learnable", "--top-k", "10", "--gcn-depth", "1"],
+        "out_tag": "fused_learnable_k10_hop1",
+    },
+
+    # --- TRỤ CỘT 4: Thời Gian (Autoregressive vs Temporal Attention Direct) ---
+    "autoregressive": {
+        "name": "T-GCN-PA (Autoregressive Decoder)",
+        "pillar": "Trụ cột 4: Động học thời gian",
+        "args": ["--graph-mode", "fused", "--fusion-type", "learnable", "--top-k", "10", "--predictor-type", "autoregressive"],
+        "out_tag": "fused_learnable_k10_autoregressive",
+    },
+
+    # --- TÙY CHỌN BỔ SUNG: Điều biến động theo ngữ cảnh thời gian thực ---
+    "dynamic": {
+        "name": "T-GCN-PA (Dynamic Context Modulation)",
+        "pillar": "Tùy chọn: Điều biến động",
+        "args": ["--graph-mode", "fused", "--fusion-type", "learnable", "--top-k", "10", "--use-dynamic"],
+        "out_tag": "fused_learnable_k10_dyn",
     },
 }
 
@@ -154,6 +189,7 @@ def print_ablation_table(dataset, seed, fold, selected_keys):
             print(row_str)
             summary_rows.append({
                 "name": cfg["name"],
+                "pillar": cfg.get("pillar", "Khác"),
                 "mae15": m15, "mae30": m30, "mae60": m60, "rmse60": r60, "mape60": p60,
             })
         except Exception as e:
@@ -168,13 +204,13 @@ def print_ablation_table(dataset, seed, fold, selected_keys):
     md_path = os.path.join(ROOT, "results", f"ablation_summary_{dataset.lower()}.md")
     try:
         with open(md_path, "w", encoding="utf-8") as f:
-            f.write(f"# Ablation Study Results — {dataset}\n\n")
-            f.write(f"| Configuration | MAE 15m | MAE 30m | MAE 60m | RMSE 60m | MAPE 60m |\n")
-            f.write(f"|---|---|---|---|---|---|\n")
+            f.write(f"# Kết Quả Nghiên Cứu Triệt Tiêu (Ablation Study) — {dataset}\n\n")
+            f.write(f"| Trụ Cột Khảo Sát | Cấu Hình Biến Thể | MAE 15m | MAE 30m | MAE 60m | RMSE 60m | MAPE 60m |\n")
+            f.write(f"|---|---|---|---|---|---|---|\n")
             for r in summary_rows:
-                f.write(f"| {r['name']} | {r['mae15']:.2f} | {r['mae30']:.2f} | {r['mae60']:.2f} | {r['rmse60']:.2f} | {r['mape60']:.2f}% |\n")
+                f.write(f"| {r['pillar']} | **{r['name']}** | {r['mae15']:.2f} | {r['mae30']:.2f} | {r['mae60']:.2f} | {r['rmse60']:.2f} | {r['mape60']:.2f}% |\n")
             if best_key:
-                f.write(f"\n**Best configuration**: `{ABLATION_CONFIGS[best_key]['name']}` with MAE 60m = **{best_mae60:.2f}**.\n")
+                f.write(f"\n> **Cấu hình tối ưu nhất**: `{ABLATION_CONFIGS[best_key]['name']}` với MAE 60m = **{best_mae60:.2f}**.\n")
         print(f"  -> Summary table saved to: {md_path}")
     except Exception:
         pass

@@ -1,26 +1,18 @@
 """
-Adaptive T-GCN — Adaptive Temporal Graph Convolutional Network
-==============================================================
-Paper tham khảo:
-  - T-GCN: Zhao et al., "T-GCN: A Temporal Graph Convolutional Network for
-    Traffic Prediction", IEEE TITS 2020.
-  - AGCRN: Bai et al., "Adaptive Graph Convolutional Recurrent Network for
-    Traffic Forecasting", NeurIPS 2020.
-
-Đóng góp mới so với T-GCN gốc:
-  1. Physical-Adaptive Graph Fusion (GraphFusionModule): kết hợp đồ thị
-     khoảng cách vật lý (A_phys) và đồ thị tự học bất đối xứng (A_adapt)
-     qua hệ số alpha cố định hoặc học được.
-  2. Top-k Sparsification: cắt bỏ các cạnh yếu để giảm nhiễu đồ thị.
-  3. Graph Regularization Loss: kiểm soát độ "gọn" của đồ thị học được.
-  4. Thiết kế Encoder-Decoder đầy đủ với Scheduled Sampling.
-
-Rút kinh nghiệm từ debug AGCRN / DCRNN / PGCRN:
-  - Toàn bộ trọng số dùng Xavier init, KHÔNG nhân hệ số nhỏ tùy tiện.
-  - Chỉ thay đổi MÔ-ĐUN ĐỒ THỊ, giữ nguyên GRU đơn giản của T-GCN để
-    cô lập rõ đóng góp trong ablation study.
-  - forward() trả về (pred, graph_reg_loss) để training loop cộng vào
-    total loss mà không cần sửa trainer.py.
+Adaptive T-GCN — Adaptive Temporal Graph Convolutional Network (v2 Enhanced)
+=============================================================================
+Đóng góp cốt lõi:
+  1. Physical-Adaptive Graph Fusion (GraphFusionModule): Hợp nhất ma trận kề
+     vật lý khoảng cách (A_phys) và ma trận tương quan thích nghi có hướng (A_adapt)
+     học từ node embeddings bất đối xứng E1, E2, kèm Top-k sparsification.
+  2. Multi-Support Directed Diffusion Graph Convolution: Mô hình hóa dòng chảy
+     giao thông xuôi dòng (forward A) và sóng xung kích tắc nghẽn dội ngược (backward A^T)
+     kết hợp tự bảo toàn trạng thái (identity I).
+  3. Input Feature & Spatial Embedding: Chiếu phi tuyến 3 kênh (flow, speed, occ)
+     kết hợp spatial positional embedding riêng cho từng trạm đo.
+  4. Multi-Scale Temporal Attention Predictor Head: Tổng hợp toàn bộ 12 bước lịch sử
+     qua Gated Temporal Convolution (GLU) và Temporal Attention Pooling, chiếu trực tiếp
+     sang 12 bước dự báo tương lai (Zero Exposure Bias, tốc độ song song cực nhanh).
 """
 
 import torch
@@ -31,126 +23,209 @@ from models.adaptive_tgcn.graph_module import GraphFusionModule
 
 
 # =========================================================================
-# TGCNCell — GRU Cell dùng Graph Convolution
+# TGCNCell — Multi-Support Directed Diffusion Graph GRU Cell
 # =========================================================================
 
 class TGCNCell(nn.Module):
     """
-    GRU Cell với Graph Convolution (hỗ trợ 1-hop thuần T-GCN và 2-hop Diffusion).
+    GRU Cell với Multi-Support Directed Diffusion Graph Convolution.
 
-    Nhận ma trận đồ thị A làm tham số forward() để A có thể được tính động
-    bởi GraphFusionModule mỗi forward pass — KHÔNG lưu A cố định trong cell.
+    Hỗ trợ 3 toán tử vật lý không gian:
+      - S_0: Identity / Self-loop (X) — bảo toàn quán tính nội tại trạm đo
+      - S_1: Forward transition (A @ X) — lan truyền xuôi dòng giao thông
+      - S_2: Backward transition (A^T @ X) — sóng xung kích dội ngược lên thượng lưu
 
-    Kiến trúc:
-        r = sigmoid(GCN([x, h], A) → 2*hidden → r)   # reset gate
-        z = sigmoid(GCN([x, h], A) → 2*hidden → z)   # update gate
-        h̃ = tanh(GCN([x, r⊙h], A) → hidden)          # candidate
-        h_new = (1 - z) ⊙ h + z ⊙ h̃
+    Hỗ trợ cả ma trận kề 2D (N, N) tĩnh và 3D (B, N, N) động.
     """
 
-    def __init__(self, in_dim: int, hidden_dim: int, num_nodes: int, gcn_depth: int = 1):
+    def __init__(self, in_dim: int, hidden_dim: int, num_nodes: int, gcn_depth: int = 2):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_nodes  = num_nodes
         self.gcn_depth  = gcn_depth
 
-        # Linear sau graph conv:
-        # Nếu gcn_depth == 1: 1-hop (Ax) -> factor = 1
-        # Nếu gcn_depth == 2: 2-hop diffusion [x, Ax, A(Ax)] -> factor = 3
-        gcn_factor = 1 if gcn_depth == 1 else 3
-        in_features = (in_dim + hidden_dim) * gcn_factor
+        # gcn_depth=1: [X, AX] (factor=2)
+        # gcn_depth=2: [X, AX, A^T X] (factor=3, multi-support directed diffusion)
+        self.num_supports = 2 if gcn_depth == 1 else 3
+        in_features = (in_dim + hidden_dim) * self.num_supports
 
         self.W_gate = nn.Linear(in_features, 2 * hidden_dim, bias=True)
         self.W_cand = nn.Linear(in_features, hidden_dim, bias=True)
 
-        # Xavier init
+        # Xavier initialization
         nn.init.xavier_uniform_(self.W_gate.weight)
         nn.init.zeros_(self.W_gate.bias)
         nn.init.xavier_uniform_(self.W_cand.weight)
         nn.init.zeros_(self.W_cand.bias)
 
-    def _graph_conv(
-        self, x: torch.Tensor, A: torch.Tensor, W: nn.Linear
-    ) -> torch.Tensor:
+    def _graph_conv(self, x: torch.Tensor, A: torch.Tensor, W: nn.Linear) -> torch.Tensor:
         """
-        Tích chập đồ thị:
-        - gcn_depth == 1: H' = A · x, rồi chiếu tuyến tính.
-        - gcn_depth == 2: H' = concat(x, A · x, A · (A · x)), rồi chiếu tuyến tính.
-
+        Tích chập đồ thị đa hướng:
         Args:
-            x : (B, N, C) — đặc trưng tại mỗi nút
-            A : (N, N)    — ma trận kề (đã chuẩn hoá)
-            W : Linear(C * factor, out_dim)
+            x : (B, N, C)
+            A : (N, N) hoặc (B, N, N)
+            W : Linear layer
         Returns:
             (B, N, out_dim)
         """
-        if self.gcn_depth == 1:
-            Ax = torch.einsum("mn, bnd -> bmd", A, x)   # (B, N, C)
-            return W(Ax)
-        elif self.gcn_depth == 2:
-            Ax = torch.einsum("mn, bnd -> bmd", A, x)    # 1-hop
-            A2x = torch.einsum("mn, bnd -> bmd", A, Ax)  # 2-hop
-            feats = torch.cat([x, Ax, A2x], dim=-1)      # (B, N, 3*C)
-            return W(feats)
-        else:
-            raise ValueError(f"Unsupported gcn_depth: {self.gcn_depth}")
+        is_3d = (A.dim() == 3)
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        h: torch.Tensor,
-        A: torch.Tensor,
-    ) -> torch.Tensor:
+        # S0: Identity (Self-loop)
+        s0 = x  # (B, N, C)
+
+        # S1: Forward (A @ x)
+        if is_3d:
+            s1 = torch.bmm(A, x)
+        else:
+            s1 = torch.einsum("mn, bnd -> bmd", A, x)
+
+        supports = [s0, s1]
+
+        # S2: Backward (A^T @ x) nếu gcn_depth >= 2
+        if self.num_supports >= 3:
+            if is_3d:
+                s2 = torch.bmm(A.transpose(1, 2), x)
+            else:
+                s2 = torch.einsum("nm, bnd -> bmd", A, x)
+            supports.append(s2)
+
+        feats = torch.cat(supports, dim=-1)  # (B, N, num_supports * C)
+        return W(feats)
+
+    def forward(self, x: torch.Tensor, h: torch.Tensor, A: torch.Tensor) -> torch.Tensor:
         """
         Args:
             x : (B, N, in_dim)
             h : (B, N, hidden_dim)
-            A : (N, N) ma trận đồ thị từ GraphFusionModule
+            A : (N, N) hoặc (B, N, N)
         Returns:
             h_new : (B, N, hidden_dim)
         """
         xh = torch.cat([x, h], dim=-1)  # (B, N, in_dim + hidden_dim)
 
         gates = torch.sigmoid(self._graph_conv(xh, A, self.W_gate))  # (B, N, 2*hidden)
-        r, z  = gates.chunk(2, dim=-1)                                # each (B, N, hidden)
+        r, z  = gates.chunk(2, dim=-1)
 
         xrh   = torch.cat([x, r * h], dim=-1)
-        h_cand = torch.tanh(self._graph_conv(xrh, A, self.W_cand))   # (B, N, hidden)
+        h_cand = torch.tanh(self._graph_conv(xrh, A, self.W_cand))
 
         h_new  = (1 - z) * h + z * h_cand
         return h_new
 
 
 # =========================================================================
-# AdaptiveTGCN — Model chính (Encoder + Direct/Autoregressive Predictor)
+# TemporalAttentionPredictor — Đầu Dự Báo Không Gian - Thời Gian Đa Tầm
+# =========================================================================
+
+class TemporalAttentionPredictor(nn.Module):
+    """
+    Đầu dự báo đa quy mô không - thời gian:
+      1. Gated Temporal Convolution (GLU) qua trục thời gian T=12 để nắm bắt
+         gia tốc, xu thế và tính chu kỳ.
+      2. Temporal Attention Pooling để tổng hợp có trọng số toàn bộ lịch sử.
+      3. Chiếu trực tiếp đa bước (Direct Multi-Horizon Projection) sang 12 bước tương lai
+         (Zero Exposure Bias, song song hoá 100% trên GPU).
+    """
+
+    def __init__(self, hidden_dim: int, horizon: int, out_dim: int = 1, num_nodes: int = 170):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.horizon    = horizon
+        self.out_dim    = out_dim
+
+        # Temporal Conv1D với GLU: kernel=3, padding=1 giữ nguyên T=12
+        self.tconv = nn.Conv1d(hidden_dim, 2 * hidden_dim, kernel_size=3, padding=1)
+
+        # Trọng số chú ý thời gian
+        self.attn_fc = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.Tanh(),
+            nn.Linear(hidden_dim // 2, 1, bias=False)
+        )
+
+        # LayerNorm kết hợp
+        self.norm_out = nn.LayerNorm(hidden_dim)
+
+        # Multi-Horizon Projection Head
+        self.proj_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * 2),
+            nn.SiLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim * 2, horizon * out_dim),
+        )
+
+        # Init
+        nn.init.xavier_uniform_(self.tconv.weight)
+        nn.init.zeros_(self.tconv.bias)
+
+    def forward(self, H_seq: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            H_seq : (B, T, N, D) — chuỗi biểu diễn ẩn từ Encoder qua T bước
+        Returns:
+            pred  : (B, horizon, N, out_dim)
+        """
+        B, T, N, D = H_seq.shape
+
+        # Đổi trục để chạy Temporal Conv1D: (B*N, D, T)
+        H_flat = H_seq.permute(0, 2, 3, 1).contiguous().view(B * N, D, T)
+        conv_out = self.tconv(H_flat)                          # (B*N, 2*D, T)
+        conv_val, conv_gate = conv_out.chunk(2, dim=1)         # each (B*N, D, T)
+        t_feat = conv_val * torch.sigmoid(conv_gate)           # GLU: (B*N, D, T)
+
+        # Đổi lại (B, T, N, D)
+        t_feat = t_feat.view(B, N, D, T).permute(0, 3, 1, 2)  # (B, T, N, D)
+
+        # Tính attention weights qua trục thời gian T
+        attn_scores = self.attn_fc(t_feat)                     # (B, T, N, 1)
+        attn_weights = torch.softmax(attn_scores, dim=1)       # softmax theo T: (B, T, N, 1)
+
+        # Tổng hợp có trọng số toàn bộ lịch sử
+        h_pool = torch.sum(attn_weights * t_feat, dim=1)       # (B, N, D)
+
+        # Residual với trạng thái ẩn bước cuối cùng
+        h_last = H_seq[:, -1, :, :]                            # (B, N, D)
+        h_combined = self.norm_out(h_pool + h_last)            # (B, N, D)
+
+        # Chiếu trực tiếp ra horizon * out_dim
+        out = self.proj_head(h_combined)                       # (B, N, horizon * out_dim)
+        out = out.view(B, N, self.horizon, self.out_dim)       # (B, N, horizon, out_dim)
+        pred = out.permute(0, 2, 1, 3)                         # (B, horizon, N, out_dim)
+        return pred
+
+
+# =========================================================================
+# AdaptiveTGCN — Mô hình hoàn chỉnh (Adaptive T-GCN v2)
 # =========================================================================
 
 class AdaptiveTGCN(nn.Module):
     """
     Adaptive T-GCN:
       - Physical-Adaptive Graph Fusion (GraphFusionModule)
-      - 2-hop Spatial-Adaptive Diffusion Convolution
-      - Direct Multi-Horizon Predictor Head (hoặc Autoregressive Decoder)
+      - Multi-Support Directed Diffusion Spatial Convolution
+      - Non-linear Feature Embedding + Learnable Spatial Positional Encoding
+      - Multi-Layer Encoder với Residual Connection & Layer Normalization
+      - Multi-Scale Temporal Attention Direct Multi-Horizon Predictor
 
     Args:
-        num_nodes        : Số nút N.
-        in_dim           : Số chiều input (mặc định 3: flow, speed, occ).
-        hidden_dim       : Chiều ẩn của TGCNCell.
-        out_dim          : Số chiều output (mặc định 1: dự báo flow).
-        num_layers       : Số lớp TGCNCell trong Encoder (và Decoder nếu có).
-        embed_dim        : Chiều embedding E1, E2 của adaptive graph.
-        horizon          : Số bước dự báo (mặc định 12).
-        adj_matrix       : Ma trận kề vật lý (N, N). Bắt buộc nếu
-                           graph_mode in {"physical", "fused"}.
+        num_nodes        : Số nút N (170 cho PEMS08, 307 cho PEMS04).
+        in_dim           : Số chiều input (3: flow, speed, occ).
+        hidden_dim       : Chiều ẩn của mạng (mặc định 64).
+        out_dim          : Số chiều output (1: dự báo flow).
+        num_layers       : Số lớp TGCNCell trong Encoder (mặc định 2).
+        embed_dim        : Chiều embedding E1, E2 của adaptive graph (mặc định 10).
+        horizon          : Số bước dự báo tương lai (mặc định 12 = 60 phút).
+        adj_matrix       : Ma trận kề vật lý (N, N). Bắt buộc nếu graph_mode in {"physical", "fused"}.
         graph_mode       : "physical" | "adaptive" | "fused".
-        fusion_type      : "fixed" | "learnable" (chỉ khi graph_mode="fused").
-        alpha            : Hệ số hợp nhất cố định (chỉ khi fusion_type="fixed").
-        top_k            : 0 = tắt sparsification; > 0 = giữ top-k cạnh/hàng.
+        fusion_type      : "fixed" | "learnable".
+        alpha            : Hệ số hợp nhất cố định (khi fusion_type="fixed").
+        top_k            : 0 = tắt; > 0 = giữ top-k cạnh/hàng.
         use_graph_reg    : Bật graph regularization loss.
-        graph_reg_weight : Trọng số của graph_reg_loss trong total loss.
+        graph_reg_weight : Trọng số graph_reg_loss.
         temperature      : Nhiệt độ scaling cho softmax A_adapt.
-        gcn_depth        : 1 (1-hop thuần) hoặc 2 (2-hop diffusion).
-        predictor_type   : "direct" (one-shot end_conv) hoặc "autoregressive".
+        gcn_depth        : 1 (1-hop) hoặc 2 (multi-support directed diffusion, mặc định 2).
+        predictor_type   : "direct" (Temporal Attention Multi-Horizon, mặc định) hoặc "autoregressive".
+        use_dynamic      : Bật điều biến động theo ngữ cảnh thời gian thực (mặc định False).
     """
 
     def __init__(
@@ -170,8 +245,9 @@ class AdaptiveTGCN(nn.Module):
         use_graph_reg: bool = False,
         graph_reg_weight: float = 1e-4,
         temperature: float = 1.0,
-        gcn_depth: int = 1,
-        predictor_type: str = "autoregressive",
+        gcn_depth: int = 2,
+        predictor_type: str = "direct",
+        use_dynamic: bool = False,
     ):
         super().__init__()
 
@@ -185,7 +261,7 @@ class AdaptiveTGCN(nn.Module):
         self.gcn_depth        = gcn_depth
         self.predictor_type   = predictor_type
 
-        # --- Mô-đun sinh ma trận đồ thị linh hoạt ---
+        # --- 1. Mô-đun sinh ma trận đồ thị linh hoạt ---
         self.graph_module = GraphFusionModule(
             num_nodes=num_nodes,
             embed_dim=embed_dim,
@@ -196,25 +272,39 @@ class AdaptiveTGCN(nn.Module):
             top_k=top_k,
             use_graph_reg=use_graph_reg,
             temperature=temperature,
+            use_dynamic=use_dynamic,
         )
 
-        # --- Encoder: num_layers TGCNCell xếp chồng ---
-        self.encoder_cells = nn.ModuleList()
-        for i in range(num_layers):
-            cell_in = in_dim if i == 0 else hidden_dim
-            self.encoder_cells.append(TGCNCell(cell_in, hidden_dim, num_nodes, gcn_depth=gcn_depth))
+        # --- 2. Input Embedding & Spatial Positional Encoding ---
+        self.input_proj = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.node_emb = nn.Parameter(torch.empty(num_nodes, hidden_dim))
+        nn.init.xavier_uniform_(self.node_emb)
 
-        # --- Predictor Head ---
+        # --- 3. Encoder: num_layers TGCNCell xếp chồng có Residual & LayerNorm ---
+        self.encoder_cells = nn.ModuleList()
+        self.layer_norms   = nn.ModuleList()
+        for i in range(num_layers):
+            self.encoder_cells.append(TGCNCell(hidden_dim, hidden_dim, num_nodes, gcn_depth=gcn_depth))
+            if i < num_layers - 1:
+                self.layer_norms.append(nn.LayerNorm(hidden_dim))
+
+        # --- 4. Predictor Head ---
         if predictor_type == "direct":
-            # Direct Multi-Horizon Predictor (chuẩn AGCRN / STGCN): chiếu trực tiếp h_last sang toàn bộ horizon
-            # Triệt tiêu exposure bias và tích luỹ sai số tự hồi quy
-            self.end_conv = nn.Conv2d(1, horizon * out_dim, kernel_size=(1, hidden_dim), bias=True)
-            nn.init.xavier_uniform_(self.end_conv.weight)
-            nn.init.zeros_(self.end_conv.bias)
+            # Multi-Scale Temporal Attention Direct Multi-Horizon Predictor (Tối ưu)
+            self.predictor = TemporalAttentionPredictor(
+                hidden_dim=hidden_dim,
+                horizon=horizon,
+                out_dim=out_dim,
+                num_nodes=num_nodes,
+            )
             self.decoder_cells = None
-            self.output_proj = None
+            self.output_proj   = None
         elif predictor_type == "autoregressive":
-            # Autoregressive Decoder tuần tự từng bước với Scheduled Sampling
+            # Fallback Autoregressive Decoder (cho tương thích backward nếu cần)
             self.decoder_cells = nn.ModuleList()
             for i in range(num_layers):
                 cell_in = out_dim if i == 0 else hidden_dim
@@ -222,7 +312,7 @@ class AdaptiveTGCN(nn.Module):
             self.output_proj = nn.Linear(hidden_dim, out_dim)
             nn.init.xavier_uniform_(self.output_proj.weight)
             nn.init.zeros_(self.output_proj.bias)
-            self.end_conv = None
+            self.predictor = None
         else:
             raise ValueError(f"Unsupported predictor_type: {predictor_type}. Must be 'direct' or 'autoregressive'.")
 
@@ -232,28 +322,45 @@ class AdaptiveTGCN(nn.Module):
             for _ in range(self.num_layers)
         ]
 
-    def encode(self, X: torch.Tensor, A: torch.Tensor) -> list:
+    def encode(self, X: torch.Tensor, A: torch.Tensor) -> tuple:
         """
         Encoder: chạy qua T bước thời gian.
 
         Args:
             X : (B, T, N, C)
-            A : (N, N) — tính 1 lần trước vòng lặp, dùng chung mọi bước t
+            A : (N, N) hoặc (B, N, N)
         Returns:
-            h : list of (B, N, hidden_dim) — hidden states tầng cuối mỗi layer
+            h      : list of (B, N, hidden_dim) — trạng thái ẩn tầng cuối
+            all_h2 : (B, T, N, hidden_dim) — chuỗi trạng thái ẩn tầng trên cùng qua T bước
         """
         B, T, N, C = X.shape
         h = self._init_hidden(B, X.device)
 
+        seq_states = []
+
         for t in range(T):
-            x_t = X[:, t, :, :]   # (B, N, C)
-            for layer_i, cell in enumerate(self.encoder_cells):
-                h[layer_i] = cell(x_t, h[layer_i], A)
-                x_t = h[layer_i]
+            # Chiếu đặc trưng đầu vào + cộng spatial node embedding
+            x_raw = X[:, t, :, :]                        # (B, N, C)
+            x_t   = self.input_proj(x_raw) + self.node_emb  # (B, N, hidden_dim)
 
-        return h
+            # Layer 0
+            h[0] = self.encoder_cells[0](x_t, h[0], A)
 
-    def decode(
+            # Các layer tiếp theo kèm Residual Connection & LayerNorm
+            x_prev = h[0]
+            for layer_i in range(1, self.num_layers):
+                cell = self.encoder_cells[layer_i]
+                norm = self.layer_norms[layer_i - 1]
+                x_in = norm(x_prev + x_t)  # residual connection
+                h[layer_i] = cell(x_in, h[layer_i], A)
+                x_prev = h[layer_i]
+
+            seq_states.append(h[-1].unsqueeze(1))  # (B, 1, N, hidden_dim)
+
+        all_h = torch.cat(seq_states, dim=1)  # (B, T, N, hidden_dim)
+        return h, all_h
+
+    def decode_autoregressive(
         self,
         h: list,
         A: torch.Tensor,
@@ -261,7 +368,7 @@ class AdaptiveTGCN(nn.Module):
         teacher_forcing_ratio: float = 0.5,
     ) -> torch.Tensor:
         """
-        Decoder: sinh horizon bước dự báo, có Scheduled Sampling (chỉ dùng khi predictor_type='autoregressive').
+        Decoder tự hồi quy (chỉ dùng khi predictor_type='autoregressive').
         """
         B = h[0].shape[0]
         device = h[0].device
@@ -277,15 +384,15 @@ class AdaptiveTGCN(nn.Module):
                 x_t = h_new[layer_i]
             h = h_new
 
-            pred_t = self.output_proj(x_t)    # (B, N, out_dim)
-            outputs.append(pred_t.unsqueeze(1))  # (B, 1, N, out_dim)
+            pred_t = self.output_proj(x_t)
+            outputs.append(pred_t.unsqueeze(1))
 
             if self.training and y_true is not None and torch.rand(1).item() < teacher_forcing_ratio:
-                dec_input = y_true[:, t, :, :]  # ground-truth
+                dec_input = y_true[:, t, :, :]
             else:
-                dec_input = pred_t.detach()      # tự hồi quy
+                dec_input = pred_t.detach()
 
-        return torch.cat(outputs, dim=1)          # (B, horizon, N, out_dim)
+        return torch.cat(outputs, dim=1)
 
     def forward(
         self,
@@ -296,26 +403,25 @@ class AdaptiveTGCN(nn.Module):
         """
         Args:
             X                      : (B, T_in=12, N, C=3)
-            y                      : (B, horizon=12, N, 1) target cho teacher forcing (chỉ dùng khi autoregressive)
+            y                      : (B, horizon=12, N, 1)
             teacher_forcing_ratio  : float
         Returns:
             pred            : (B, horizon, N, out_dim)
-            graph_reg_loss  : scalar tensor (0.0 nếu use_graph_reg=False)
+            graph_reg_loss  : scalar tensor
         """
-        # Tính A một lần trước toàn bộ forward pass
-        A = self.graph_module()                    # (N, N)
+        # Sinh ma trận đồ thị từ GraphFusionModule
+        A = self.graph_module()
 
-        h = self.encode(X, A)
+        # Mã hóa chuỗi không - thời gian
+        h_last_list, H_seq = self.encode(X, A)
 
+        # Dự báo tương lai
         if self.predictor_type == "direct":
-            # Direct multi-horizon projection
-            h_last = h[-1].unsqueeze(1)             # (B, 1, N, hidden_dim)
-            out = self.end_conv(h_last).squeeze(-1) # (B, horizon * out_dim, N)
-            out = out.view(X.shape[0], self.horizon, self.out_dim, self.num_nodes)
-            pred = out.permute(0, 1, 3, 2)          # (B, horizon, N, out_dim)
+            pred = self.predictor(H_seq)
         else:
-            pred = self.decode(h, A, y_true=y, teacher_forcing_ratio=teacher_forcing_ratio)
+            pred = self.decode_autoregressive(h_last_list, A, y_true=y, teacher_forcing_ratio=teacher_forcing_ratio)
 
+        # Graph regularization loss
         if self.use_graph_reg:
             graph_reg_loss = self.graph_reg_weight * self.graph_module.compute_graph_reg_loss()
         else:
@@ -338,12 +444,14 @@ if __name__ == "__main__":
         dict(graph_mode="physical",  fusion_type="fixed",     adj_matrix=adj, predictor_type="direct", gcn_depth=2),
         dict(graph_mode="adaptive",  fusion_type="fixed",     adj_matrix=None, predictor_type="direct", gcn_depth=2),
         dict(graph_mode="fused",     fusion_type="fixed",     adj_matrix=adj, alpha=0.5, predictor_type="direct", gcn_depth=2),
-        dict(graph_mode="fused",     fusion_type="learnable", adj_matrix=adj, predictor_type="direct", gcn_depth=2),
-        dict(graph_mode="fused",     fusion_type="learnable", adj_matrix=adj, top_k=10, predictor_type="direct", gcn_depth=2),
-        dict(graph_mode="fused",     fusion_type="learnable", adj_matrix=adj, top_k=10, use_graph_reg=True, predictor_type="direct", gcn_depth=2),
+        dict(graph_mode="fused",     fusion_type="learnable", adj_matrix=adj, top_k=5, predictor_type="direct", gcn_depth=2),
+        dict(graph_mode="fused",     fusion_type="learnable", adj_matrix=adj, top_k=5, use_graph_reg=True, predictor_type="direct", gcn_depth=2),
         dict(graph_mode="fused",     fusion_type="learnable", adj_matrix=adj, predictor_type="autoregressive", gcn_depth=1),
     ]
 
+    print(f"{'='*80}")
+    print("Testing AdaptiveTGCN Architectures:")
+    print(f"{'='*80}")
     for cfg in configs:
         model = AdaptiveTGCN(num_nodes=N, in_dim=C, hidden_dim=64, **cfg)
         X = torch.randn(B, T, N, C)
@@ -351,5 +459,6 @@ if __name__ == "__main__":
         pred, reg_loss = model(X, y=Y, teacher_forcing_ratio=0.5)
         params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         label = f"mode={cfg['graph_mode']:<8} pred={cfg['predictor_type']:<14} hop={cfg['gcn_depth']} reg={cfg.get('use_graph_reg',False)}"
-        print(f"[{label}] out={pred.shape} reg_loss={reg_loss.item():.6f} params={params:,}")
-
+        print(f"[{label}] out={list(pred.shape)} reg={reg_loss.item():.6f} params={params:,}")
+    print(f"{'='*80}")
+    print("All architecture configurations passed self-test successfully!")

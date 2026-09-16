@@ -1,7 +1,7 @@
 """
 GraphFusionModule — Mô-đun sinh ma trận đồ thị linh hoạt
 =========================================================
-Hỗ trợ 3 chế độ đồ thị:
+Hỗ trợ 3 chế độ đồ thị cốt lõi:
   - "physical"  : chỉ dùng A_phys cố định
   - "adaptive"  : học A_adapt từ E1, E2 bất đối xứng (vì giao thông có hướng)
   - "fused"     : kết hợp A_phys + A_adapt theo alpha (fixed hoặc learnable)
@@ -12,13 +12,8 @@ Tùy chọn bổ sung:
                              độ thưa và ổn định của đồ thị học được
   - temperature scaling    : softmax(logits / temperature) — temperature < 1
                              làm A_adapt sắc nét hơn, ít đồng đều hơn
-                             (debug fix cho hiện tượng A_a suy biến uniform)
-
-Rút kinh nghiệm từ debug PGCRN / AGCRN:
-  - TUYỆT ĐỐI không nhân random init bằng hệ số nhỏ tùy tiện (như *0.01)
-    vì sẽ triệt tiêu gradient qua các bước GRU. Luôn dùng Xavier / Kaiming.
-  - Bước 2a (Debug adaptive graph): Thêm temperature scaling để tránh A_adapt
-    suy biến thành phân phối uniform khi E1 @ E2.T cho ra giá trị gần bằng nhau.
+  - dynamic modulation     : Điều biến động theo ngữ cảnh giao thông thời gian thực
+                             (tùy chọn bật tắt, mặc định False để tương thích tuyệt đối với Ablation)
 """
 
 import torch
@@ -29,7 +24,7 @@ import numpy as np
 
 class GraphFusionModule(nn.Module):
     """
-    Sinh ma trận đồ thị A (N, N) theo graph_mode đã chọn.
+    Sinh ma trận đồ thị A theo graph_mode đã chọn.
 
     Args:
         num_nodes    : Số nút đồ thị N.
@@ -41,6 +36,9 @@ class GraphFusionModule(nn.Module):
         alpha        : Hệ số hợp nhất cố định (0–1), dùng khi fusion_type="fixed".
         top_k        : Nếu > 0: giữ top-k cạnh mạnh nhất mỗi hàng (0 = tắt).
         use_graph_reg: Nếu True: compute_graph_reg_loss() trả về L2 norm của A_adapt.
+        temperature  : Nhiệt độ scaling cho softmax A_adapt.
+        use_dynamic  : Bật điều biến đồ thị động theo ngữ cảnh thời gian thực.
+        dyn_dim      : Chiều đặc trưng chiếu cho dynamic graph.
     """
 
     def __init__(
@@ -54,16 +52,20 @@ class GraphFusionModule(nn.Module):
         top_k: int = 0,
         use_graph_reg: bool = False,
         temperature: float = 1.0,
+        use_dynamic: bool = False,
+        dyn_dim: int = 16,
     ):
         super().__init__()
 
-        self.num_nodes    = num_nodes
-        self.embed_dim    = embed_dim
-        self.graph_mode   = graph_mode
-        self.fusion_type  = fusion_type
-        self.top_k        = top_k
+        self.num_nodes     = num_nodes
+        self.embed_dim     = embed_dim
+        self.graph_mode    = graph_mode
+        self.fusion_type   = fusion_type
+        self.top_k         = top_k
         self.use_graph_reg = use_graph_reg
-        self.temperature  = temperature
+        self.temperature   = temperature
+        self.use_dynamic   = use_dynamic
+        self.dyn_dim       = dyn_dim
 
         # ----- Ma trận vật lý cố định (không phải tham số học được) -----
         if graph_mode in ("physical", "fused"):
@@ -75,6 +77,9 @@ class GraphFusionModule(nn.Module):
                 A_p = adj_matrix.clone().detach().float()
             # Đảm bảo không có NaN / Inf
             A_p = torch.nan_to_num(A_p, nan=0.0, posinf=0.0, neginf=0.0)
+            # Thêm self-loop nhẹ nếu đường chéo toàn 0
+            if torch.diag(A_p).sum() == 0:
+                A_p = A_p + torch.eye(num_nodes, device=A_p.device)
             # Chuẩn hoá hàng để tổng mỗi hàng = 1
             row_sum = A_p.sum(dim=-1, keepdim=True).clamp(min=1e-6)
             A_p = A_p / row_sum
@@ -99,29 +104,22 @@ class GraphFusionModule(nn.Module):
                 self._alpha_param = nn.Parameter(torch.zeros(1))
             else:
                 self._alpha_fixed = alpha
-        
+
+        # ----- Dynamic Context-Aware Modulation (Tùy chọn) -----
+        if use_dynamic:
+            self.q_proj = nn.Linear(embed_dim, dyn_dim, bias=False)
+            self.k_proj = nn.Linear(embed_dim, dyn_dim, bias=False)
+            # Gamma điều biến: khởi tạo ~ 0.1 (sigmoid(-2.2) ≈ 0.1)
+            self._gamma_param = nn.Parameter(torch.tensor([-2.2]))
+        else:
+            self.q_proj = None
+            self.k_proj = None
+
     def _compute_adaptive_adj(self) -> torch.Tensor:
         """
         Tính A_adapt = softmax(ReLU(E1 @ E2.T) / temperature, dim=-1), shape (N, N).
-
-        temperature < 1.0 làm phân phối "sắc nét" hơn (peaky), giảm hiện tượng
-        A_adapt suy biến thành phân phối đồng đều (uniform) khi E1 @ E2.T cho
-        ra giá trị gần bằng nhau ở mọi cặp nút (Bước 2a debug adaptive graph).
-
-        Ghi chú toán học (Bước 3):
-          - AGCRN dùng E @ E.T (1 embedding): ma trận kết quả luôn đối xứng và
-            positive semi-definite (PSD). PSD đảm bảo eigenvalue >= 0, gradient
-            lan truyền ổn định hơn.
-          - AdaptiveTGCN dùng E1 @ E2.T (2 embedding): ma trận bất kỳ, không
-            có ràng buộc PSD. Khởi tạo ngẫu nhiên Xavier cho E1, E2 khiến
-            E1 @ E2.T có giá trị gần đồng đều (mean ≈ 0, variance nhỏ sau relu),
-            dẫn đến softmax → uniform → GCN chỉ làm phép trung bình đơn giản.
-          - Giải pháp ngắn hạn: temperature scaling (Bước 2a).
-          - Giải pháp dài hạn: tăng embed_dim (Bước 2b) hoặc khởi tạo E2 = E1
-            như AGCRN để đảm bảo cấu trúc PSD ban đầu.
         """
         logits  = F.relu(self.E1 @ self.E2.T)          # (N, N), bất đối xứng
-        # Chia cho temperature trước softmax (temperature < 1 → sắc nét hơn)
         A_adapt = torch.softmax(logits / self.temperature, dim=-1)   # (N, N)
         return A_adapt
 
@@ -129,42 +127,31 @@ class GraphFusionModule(nn.Module):
         """
         Giữ lại top-k giá trị lớn nhất mỗi hàng, đặt phần còn lại về 0,
         sau đó re-normalize để tổng mỗi hàng = 1.
-
-        Args:
-            A: (N, N) ma trận kề cần làm thưa.
-        Returns:
-            A_sparse: (N, N) đã thưa và chuẩn hóa lại.
         """
         k = min(self.top_k, self.num_nodes)
-        # topk theo hàng
-        topk_vals, topk_idx = A.topk(k, dim=-1)     # (N, k)
-        # Tạo mask (N, N) chỉ giữ các cột top-k
+        topk_vals, topk_idx = A.topk(k, dim=-1)     # (..., N, k)
         mask = torch.zeros_like(A)
-        mask.scatter_(1, topk_idx, 1.0)
+        mask.scatter_(-1, topk_idx, 1.0)
         A_sparse = A * mask
-        # Re-normalize hàng
         row_sum = A_sparse.sum(dim=-1, keepdim=True).clamp(min=1e-6)
         return A_sparse / row_sum
 
     def compute_graph_reg_loss(self) -> torch.Tensor:
         """
         Trả về graph regularization loss = L2 norm của A_adapt (Frobenius norm).
-        Dùng để ép đồ thị học được gọn hơn và tránh overfitting.
-        Cộng vào total loss với trọng số nhỏ (ví dụ 1e-4) trong training loop.
         """
         if self.E1 is None:
             return torch.tensor(0.0)
         A_adapt = self._compute_adaptive_adj()
-        return (A_adapt ** 2).sum()   # Frobenius norm bình phương
+        return (A_adapt ** 2).sum()
 
-    def forward(self) -> torch.Tensor:
+    def get_base_adj(self) -> torch.Tensor:
         """
-        Trả về ma trận đồ thị cuối cùng A (N, N) theo graph_mode đã cấu hình.
+        Tính ma trận cơ sở tĩnh (N, N) theo graph_mode đã cấu hình.
         """
         if self.graph_mode == "physical":
             return self.A_phys
 
-        # Tính adaptive
         A_adapt = self._compute_adaptive_adj()
 
         if self.graph_mode == "adaptive":
@@ -172,9 +159,9 @@ class GraphFusionModule(nn.Module):
                 A_adapt = self._topk_sparsify(A_adapt)
             return A_adapt
 
-        # ---- graph_mode == "fused" ----
+        # graph_mode == "fused"
         if self.fusion_type == "learnable":
-            alpha = torch.sigmoid(self._alpha_param)  # ép về (0, 1)
+            alpha = torch.sigmoid(self._alpha_param)
         else:
             alpha = self._alpha_fixed
 
@@ -182,3 +169,25 @@ class GraphFusionModule(nn.Module):
         if self.top_k > 0:
             A_fused = self._topk_sparsify(A_fused)
         return A_fused
+
+    def forward(self, node_states: torch.Tensor = None) -> torch.Tensor:
+        """
+        Trả về ma trận đồ thị A.
+        Nếu use_dynamic=True và có node_states (B, N, D): trả về (B, N, N).
+        Ngược lại trả về (N, N).
+        """
+        A_base = self.get_base_adj()  # (N, N)
+
+        if self.use_dynamic and node_states is not None and self.q_proj is not None:
+            # node_states: (B, N, D)
+            B, N, _ = node_states.shape
+            q = self.q_proj(node_states)   # (B, N, dyn_dim)
+            k = self.k_proj(node_states)   # (B, N, dyn_dim)
+            scores = torch.bmm(q, k.transpose(1, 2)) / (self.dyn_dim ** 0.5)
+            A_dyn = torch.softmax(scores, dim=-1)  # (B, N, N)
+
+            gamma = torch.sigmoid(self._gamma_param)  # scalar in (0, 1)
+            A_final = (1 - gamma) * A_base.unsqueeze(0) + gamma * A_dyn
+            return A_final
+
+        return A_base

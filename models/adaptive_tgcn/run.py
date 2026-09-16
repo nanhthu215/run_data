@@ -212,10 +212,12 @@ def get_args():
     parser.add_argument("--embed-dim",  type=int,   default=10,
                         help="Embed dim của E1, E2 (mặc định 10)")
     parser.add_argument("--num-layers", type=int,   default=2)
-    parser.add_argument("--gcn-depth",  type=int,   default=1, choices=[1, 2],
-                        help="Độ sâu tích chập đồ thị: 1 (1-hop thuần T-GCN, mặc định) hoặc 2 (2-hop diffusion)")
-    parser.add_argument("--predictor-type", type=str, default="autoregressive", choices=["direct", "autoregressive"],
-                        help="Loại đầu ra: 'direct' (one-shot end_conv) hoặc 'autoregressive' (tuần tự qua decoder, mặc định)")
+    parser.add_argument("--gcn-depth",  type=int,   default=2, choices=[1, 2],
+                        help="Độ sâu tích chập đồ thị: 1 (1-hop) hoặc 2 (Multi-Support Directed Diffusion, mặc định 2)")
+    parser.add_argument("--predictor-type", type=str, default="direct", choices=["direct", "autoregressive"],
+                        help="Loại đầu ra: 'direct' (Temporal Attention Multi-Horizon, mặc định) hoặc 'autoregressive'")
+    parser.add_argument("--use-dynamic", action="store_true",
+                        help="Bật điều biến đồ thị động theo ngữ cảnh thời gian thực")
     # Training
     parser.add_argument("--epochs",     type=int,   default=100)
     parser.add_argument("--lr",         type=float, default=1e-3)
@@ -293,6 +295,7 @@ def main():
         temperature     = args.temperature,
         gcn_depth       = args.gcn_depth,
         predictor_type  = args.predictor_type,
+        use_dynamic     = args.use_dynamic,
     )
 
     # ----- Tên model cho log và checkpoint -----
@@ -305,10 +308,12 @@ def main():
         mode_tag += f"_k{args.top_k}"
     if args.use_graph_reg:
         mode_tag += "_reg"
-    if args.gcn_depth != 1:
+    if args.gcn_depth != 2:
         mode_tag += f"_hop{args.gcn_depth}"
-    if args.predictor_type != "autoregressive":
+    if args.predictor_type != "direct":
         mode_tag += f"_{args.predictor_type}"
+    if args.use_dynamic:
+        mode_tag += "_dyn"
     if args.temperature != 1.0:
         mode_tag += f"_t{args.temperature}"
     if args.embed_dim != 10:
