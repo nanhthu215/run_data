@@ -121,6 +121,20 @@ ABLATION_CONFIGS = {
         "out_tag": "fused_learnable_k10_autoregressive",
     },
 
+    # --- TRỤ CỘT 5: Tiền Xử Lý Phi Tuyến & Mã Hóa Vị Trí Không Gian (Input & Spatial Encoding) ---
+    "no_pos": {
+        "name": "T-GCN-PA (w/o Spatial Positional Encoding)",
+        "pillar": "Trụ cột 5: Mã hóa vị trí không gian",
+        "args": ["--graph-mode", "fused", "--fusion-type", "learnable", "--top-k", "10", "--no-spatial-pos-emb"],
+        "out_tag": "fused_learnable_k10_no_pos",
+    },
+    "linear_no_pos": {
+        "name": "T-GCN-PA (Linear only, w/o Pos Emb)",
+        "pillar": "Trụ cột 5: Tiền xử lý phi tuyến & Mã hóa vị trí",
+        "args": ["--graph-mode", "fused", "--fusion-type", "learnable", "--top-k", "10", "--input-proj-type", "linear", "--no-spatial-pos-emb"],
+        "out_tag": "fused_learnable_k10_linear_no_pos",
+    },
+
     # --- TÙY CHỌN BỔ SUNG: Điều biến động theo ngữ cảnh thời gian thực ---
     "dynamic": {
         "name": "T-GCN-PA (Dynamic Context Modulation)",

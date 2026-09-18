@@ -218,6 +218,10 @@ def get_args():
                         help="Loại đầu ra: 'direct' (Temporal Attention Multi-Horizon, mặc định) hoặc 'autoregressive'")
     parser.add_argument("--use-dynamic", action="store_true",
                         help="Bật điều biến đồ thị động theo ngữ cảnh thời gian thực")
+    parser.add_argument("--input-proj-type", type=str, default="mlp", choices=["mlp", "linear"],
+                        help="Kiểu chiếu đầu vào: 'mlp' (2 lớp MLP phi tuyến với SiLU) hoặc 'linear' (1 lớp tuyến tính đơn thuần)")
+    parser.add_argument("--no-spatial-pos-emb", action="store_true",
+                        help="Tắt nhúng vị trí không gian (Spatial Positional Encoding)")
     # Training
     parser.add_argument("--epochs",     type=int,   default=100)
     parser.add_argument("--lr",         type=float, default=1e-3)
@@ -296,6 +300,8 @@ def main():
         gcn_depth       = args.gcn_depth,
         predictor_type  = args.predictor_type,
         use_dynamic     = args.use_dynamic,
+        input_proj_type = args.input_proj_type,
+        use_spatial_pos_emb = not args.no_spatial_pos_emb,
     )
 
     # ----- Tên model cho log và checkpoint -----
@@ -314,6 +320,10 @@ def main():
         mode_tag += f"_{args.predictor_type}"
     if args.use_dynamic:
         mode_tag += "_dyn"
+    if args.input_proj_type != "mlp":
+        mode_tag += f"_{args.input_proj_type}"
+    if args.no_spatial_pos_emb:
+        mode_tag += "_no_pos"
     if args.temperature != 1.0:
         mode_tag += f"_t{args.temperature}"
     if args.embed_dim != 10:
@@ -408,6 +418,8 @@ def main():
         "temperature"     : args.temperature,
         "gcn_depth"       : args.gcn_depth,
         "predictor_type"  : args.predictor_type,
+        "input_proj_type" : args.input_proj_type,
+        "use_spatial_pos_emb": not args.no_spatial_pos_emb,
         "hidden_dim"      : args.hidden_dim,
         "embed_dim"       : args.embed_dim,
         "num_layers"      : args.num_layers,

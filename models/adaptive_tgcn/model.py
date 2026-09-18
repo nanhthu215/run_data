@@ -248,6 +248,8 @@ class AdaptiveTGCN(nn.Module):
         gcn_depth: int = 2,
         predictor_type: str = "direct",
         use_dynamic: bool = False,
+        input_proj_type: str = "mlp",
+        use_spatial_pos_emb: bool = True,
     ):
         super().__init__()
 
@@ -260,6 +262,8 @@ class AdaptiveTGCN(nn.Module):
         self.graph_reg_weight = graph_reg_weight
         self.gcn_depth        = gcn_depth
         self.predictor_type   = predictor_type
+        self.input_proj_type  = input_proj_type
+        self.use_spatial_pos_emb = use_spatial_pos_emb
 
         # --- 1. Mô-đun sinh ma trận đồ thị linh hoạt ---
         self.graph_module = GraphFusionModule(
@@ -276,13 +280,20 @@ class AdaptiveTGCN(nn.Module):
         )
 
         # --- 2. Input Embedding & Spatial Positional Encoding ---
-        self.input_proj = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
-        self.node_emb = nn.Parameter(torch.empty(num_nodes, hidden_dim))
-        nn.init.xavier_uniform_(self.node_emb)
+        if input_proj_type == "linear":
+            self.input_proj = nn.Linear(in_dim, hidden_dim)
+        else:
+            self.input_proj = nn.Sequential(
+                nn.Linear(in_dim, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, hidden_dim),
+            )
+
+        if use_spatial_pos_emb:
+            self.node_emb = nn.Parameter(torch.empty(num_nodes, hidden_dim))
+            nn.init.xavier_uniform_(self.node_emb)
+        else:
+            self.node_emb = None
 
         # --- 3. Encoder: num_layers TGCNCell xếp chồng có Residual & LayerNorm ---
         self.encoder_cells = nn.ModuleList()
@@ -339,9 +350,11 @@ class AdaptiveTGCN(nn.Module):
         seq_states = []
 
         for t in range(T):
-            # Chiếu đặc trưng đầu vào + cộng spatial node embedding
+            # Chiếu đặc trưng đầu vào + cộng spatial node embedding (nếu có)
             x_raw = X[:, t, :, :]                        # (B, N, C)
-            x_t   = self.input_proj(x_raw) + self.node_emb  # (B, N, hidden_dim)
+            x_t   = self.input_proj(x_raw)
+            if self.node_emb is not None:
+                x_t = x_t + self.node_emb                # (B, N, hidden_dim)
 
             # Layer 0
             h[0] = self.encoder_cells[0](x_t, h[0], A)
