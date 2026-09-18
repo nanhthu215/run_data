@@ -1,0 +1,43 @@
+{
+  "model": "AdaptiveTGCN",
+  "dataset": "PEMS08",
+  "config": {
+    "graph_mode": "fused",
+    "fusion_type": "learnable",
+    "alpha": 0.5,
+    "top_k": 10,
+    "use_graph_reg": true,
+    "graph_reg_weight": 0.0001,
+    "temperature": 1.0,
+    "gcn_depth": 2,
+    "predictor_type": "direct",
+    "hidden_dim": 64,
+    "embed_dim": 10,
+    "num_layers": 2,
+    "epochs": 100,
+    "lr": 0.001,
+    "batch_size": 64,
+    "seed": 42,
+    "fold": "0"
+  },
+  "results": {
+    "15": {
+      "mae": 15.037029266357422,
+      "rmse": 23.887771606445312,
+      "mape": 9.53963851928711,
+      "wmape": 6.414371013641357
+    },
+    "30": {
+      "mae": 15.94123363494873,
+      "rmse": 25.42682456970215,
+      "mape": 10.019709587097168,
+      "wmape": 6.7894487380981445
+    },
+    "60": {
+      "mae": 17.666549682617188,
+      "rmse": 27.818504333496094,
+      "mape": 11.402460098266602,
+      "wmape": 7.500472545623779
+    }
+  }
+}
